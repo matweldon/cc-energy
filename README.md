@@ -119,6 +119,35 @@ Global running tally updated after each turn (Stop hook), using a dedicated curs
 }
 ```
 
+## Releasing
+
+Releases are triggered by **pushing a version tag**. Don't create the release in the GitHub
+UI first: the workflow creates it, and an existing release for the same tag would clash.
+
+1. Set `version` in `Cargo.toml` and commit (the PyPI version is read from it too).
+2. Tag that commit with the same version and push the tag:
+
+   ```
+   git tag v0.1.0
+   git push origin v0.1.0
+   ```
+
+This runs two workflows:
+
+- **Release** (`.github/workflows/release.yml`, cargo-dist): builds binaries for Linux
+  (x86_64, ARM64, static musl), macOS (Intel, Apple Silicon) and Windows. It also builds the
+  shell and PowerShell installers and checksums, and creates the GitHub release with them
+  attached. cargo-dist checks that the tag matches the crate version.
+- **PyPI** (`.github/workflows/pypi.yml`, maturin): builds wheels and publishes them with
+  trusted publishing. This needs a one-time "pending publisher" on pypi.org: project
+  `cc-energy`, owner `matweldon`, repository `cc-energy`, workflow `pypi.yml`, environment
+  `pypi`. Without it, the publish step fails, but the GitHub release is unaffected.
+
+A suffix such as `v0.2.0-beta.1` marks the release as a pre-release. The release workflow
+also runs a dry-run plan on pull requests, and the PyPI workflow can be run manually to
+build wheels without publishing. To change targets or installers, edit
+`dist-workspace.toml` and run `dist generate`.
+
 ## Caveats
 
 These are marginal, bottom-up estimates at facility level (PUE included) with wide uncertainty.
