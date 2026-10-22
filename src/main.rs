@@ -1,11 +1,13 @@
 //! cc-energy: fast energy estimates for Claude Code JSONL transcripts.
 //!
-//! Model (per API call; all inputs in tokens, energy in joules, reported in Wh = J/3600):
-//!   E = W*w_in*(1 + Cw/K_in) + O*w_out*(1 + Co/K_out) + R*kv
-//! where W = uncached input + cache writes, O = output, R = cache reads,
+//! Model (per API call; inputs in tokens, energy in joules, reported in Wh = J/3600):
+//!   E = W*(N*e_in + prefill_attn(Cw)) + O*(N*e_out + decode_attn(Co)) + R*kv
+//! where W = uncached input + cache writes, O = output, R = cache reads, N = active parameters,
 //! Cw = R + W/2 and Co = R + W + O/2 are the context (tokens) seen by new and output tokens.
-//! w_in, w_out: J per token at zero context. K_in, K_out: crossover context (tokens) at which
-//! attention cost equals the base cost. kv: J per cache-read token (KV storage, default 0).
+//! Prefill attention costs FLOPs per context token; decode attention costs KV-cache bytes read
+//! per context token. Both depend on the attention type (--attention gqa|mla|sparse).
+//! Efficiency figures are fixed; low/central/high are three model architectures
+//! (37B / 122B / 405B active parameters).
 //!
 //! Modes:
 //!   cumulative (default)  scan everything, print totals
@@ -20,19 +22,96 @@ use std::path::{Path, PathBuf};
 
 // ---------- model ----------
 
+// Fixed central efficiency figures, facility level (including PUE).
+/// J per attention FLOP: bf16 maths at ~40% utilisation, plus host and building overheads.
+const J_PER_ATTN_FLOP: f64 = 2.0e-12;
+/// J per KV-cache byte read during decode: accelerator memory streaming plus overheads.
+const J_PER_KV_BYTE: f64 = 2.3e-10;
+/// Weights cost per active parameter per input token (InferenceMAX-calibrated: 0.288 J at 37B).
+const J_IN_PER_PARAM: f64 = 0.288 / 37.0e9;
+/// Weights cost per active parameter per output token (5x input).
+const J_OUT_PER_PARAM: f64 = 5.0 * J_IN_PER_PARAM;
+const J_PER_WH: f64 = 3600.0;
+
+// Attention geometry shared by all three architectures.
+const Q_HEADS: f64 = 128.0;
+const HEAD_DIM: f64 = 128.0;
+const KV_BYTES: f64 = 2.0; // bf16 KV cache
+// Grouped-query attention (Llama 3.1 style)
+const GQA_KV_HEADS: f64 = 8.0;
+// Multi-head latent attention (DeepSeek V3 style)
+const MLA_QK_DIM: f64 = 192.0; // 128 no-position + 64 rotary
+const MLA_V_DIM: f64 = 128.0;
+const MLA_LATENT: f64 = 576.0; // 512 latent + 64 rotary, stored per token per layer
+// DeepSeek sparse attention (V3.2 style): MLA over the top-k selected tokens plus an indexer.
+const DSA_TOPK: f64 = 2048.0;
+const DSA_INDEX_HEADS: f64 = 64.0;
+const DSA_INDEX_DIM: f64 = 128.0;
+const DSA_INDEX_FLOP_FACTOR: f64 = 0.5; // indexer runs in fp8
+const DSA_INDEX_KEY_BYTES: f64 = 128.0; // fp8 index key per token per layer
+
 #[derive(Clone, Copy)]
-struct Coef {
-    w_in: f64,  // J per input/cache-write token at zero context
-    k_in: f64,  // crossover context, tokens
-    w_out: f64, // J per output token at zero context
-    k_out: f64, // crossover context, tokens
+struct Arch {
+    active_params: f64,
+    layers: f64,
 }
 
-const LOW: Coef = Coef { w_in: 0.108, k_in: 60_000.0, w_out: 0.72, k_out: 400_000.0 / 3.0 };
-const CENTRAL: Coef = Coef { w_in: 0.288, k_in: 80_000.0 / 3.0, w_out: 1.44, k_out: 400_000.0 / 7.0 };
-const HIGH: Coef = Coef { w_in: 0.612, k_in: 85_000.0 / 3.0, w_out: 3.96, k_out: 550_000.0 / 7.0 };
+/// low / central / high: DeepSeek-V3-scale MoE, a hypothetical midpoint, Llama-3.1-405B-scale dense.
+const ARCHS: [Arch; 3] = [
+    Arch { active_params: 37.0e9, layers: 61.0 },
+    Arch { active_params: 122.0e9, layers: 96.0 },
+    Arch { active_params: 405.0e9, layers: 126.0 },
+];
 
-const J_PER_WH: f64 = 3600.0;
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Attention {
+    Gqa,
+    Mla,
+    Sparse,
+}
+
+impl Attention {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "gqa" => Some(Self::Gqa),
+            "mla" => Some(Self::Mla),
+            "sparse" | "dsa" => Some(Self::Sparse),
+            _ => None,
+        }
+    }
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Gqa => "gqa",
+            Self::Mla => "mla",
+            Self::Sparse => "sparse",
+        }
+    }
+    /// J per new token for prefill attention over `c` context tokens.
+    fn prefill_j(&self, layers: f64, c: f64) -> f64 {
+        let mla_flops = 2.0 * Q_HEADS * (MLA_QK_DIM + MLA_V_DIM) * layers;
+        let flops = match self {
+            Self::Gqa => 4.0 * Q_HEADS * HEAD_DIM * layers * c,
+            Self::Mla => mla_flops * c,
+            Self::Sparse => {
+                mla_flops * c.min(DSA_TOPK)
+                    + 2.0 * DSA_INDEX_HEADS * DSA_INDEX_DIM * DSA_INDEX_FLOP_FACTOR * layers * c
+            }
+        };
+        flops * J_PER_ATTN_FLOP
+    }
+    /// J per output token for decode attention (KV-cache reads) over `c` context tokens.
+    fn decode_j(&self, layers: f64, c: f64) -> f64 {
+        let bytes = match self {
+            Self::Gqa => 2.0 * GQA_KV_HEADS * HEAD_DIM * KV_BYTES * layers * c,
+            Self::Mla => MLA_LATENT * KV_BYTES * layers * c,
+            Self::Sparse => {
+                MLA_LATENT * KV_BYTES * layers * c.min(DSA_TOPK) + DSA_INDEX_KEY_BYTES * layers * c
+            }
+        };
+        bytes * J_PER_KV_BYTE
+    }
+}
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Serialize, Deserialize)]
 struct Tok {
@@ -60,15 +139,19 @@ impl Tok {
 }
 
 /// Energy in Wh for one call: [low, central, high].
-fn energy(t: &Tok, simple_ctx: bool, kv: f64) -> [f64; 3] {
+fn energy(t: &Tok, opts: &Opts) -> [f64; 3] {
     let w = t.w();
     let o = t.output as f64;
     let r = t.cache_read as f64;
-    let (cw, co) = if simple_ctx { (r, r) } else { (r + w / 2.0, r + w + o / 2.0) };
-    let f = |c: Coef| {
-        (w * c.w_in * (1.0 + cw / c.k_in) + o * c.w_out * (1.0 + co / c.k_out) + r * kv) / J_PER_WH
-    };
-    [f(LOW), f(CENTRAL), f(HIGH)]
+    let (cw, co) = if opts.simple_ctx { (r, r) } else { (r + w / 2.0, r + w + o / 2.0) };
+    let mut e = [0.0; 3];
+    for (i, a) in ARCHS.iter().enumerate() {
+        let joules = w * (a.active_params * J_IN_PER_PARAM + opts.attention.prefill_j(a.layers, cw))
+            + o * (a.active_params * J_OUT_PER_PARAM + opts.attention.decode_j(a.layers, co))
+            + r * opts.kv;
+        e[i] = joules / J_PER_WH;
+    }
+    e
 }
 
 // ---------- aggregation ----------
@@ -200,6 +283,7 @@ impl Seen {
 struct Opts {
     simple_ctx: bool,
     kv: f64,
+    attention: Attention,
 }
 
 /// Process records from a reader. `seen_global` is used in cumulative mode (unbounded);
@@ -233,7 +317,7 @@ fn process<R: BufRead>(
             continue; // synthetic / placeholder records
         }
         let sub = sub_file || rec.sidechain;
-        let e_new = energy(&rec.tok, opts.simple_ctx, opts.kv);
+        let e_new = energy(&rec.tok, opts);
         let Some(id) = rec.id.clone() else {
             rep.record(sub, &rec.model, 1, &rec.tok, &e_new);
             continue;
@@ -264,8 +348,8 @@ fn process<R: BufRead>(
             Some(old) => {
                 let merged = old.max(&rec.tok);
                 if merged != old {
-                    let e_old = energy(&old, opts.simple_ctx, opts.kv);
-                    let e_m = energy(&merged, opts.simple_ctx, opts.kv);
+                    let e_old = energy(&old, opts);
+                    let e_m = energy(&merged, opts);
                     let dt = Tok {
                         input: merged.input - old.input,
                         cache_write: merged.cache_write - old.cache_write,
@@ -353,6 +437,8 @@ struct FileCursor {
 #[derive(Default, Serialize, Deserialize)]
 struct Cursor {
     version: u32,
+    #[serde(default)]
+    attention: Option<Attention>,
     files: BTreeMap<String, FileCursor>,
     totals: Report,
 }
@@ -445,9 +531,10 @@ fn fmt_range(a: &Agg) -> String {
     format!("{} central ({}–{})", fmt_wh(a.wh[1]), fmt_wh(a.wh[0]), fmt_wh(a.wh[2]))
 }
 
-fn print_text(title: &str, r: &Report, out: &mut impl Write) -> io::Result<()> {
+fn print_text(title: &str, r: &Report, att: Attention, out: &mut impl Write) -> io::Result<()> {
     let t = &r.total;
     writeln!(out, "{title}")?;
+    writeln!(out, "Model: {} attention · low/central/high = 37B/122B/405B active parameters", att.name())?;
     writeln!(out, "Files: {} ({} subagent) · calls: {} · usage lines: {}", r.files, r.subagent_files, t.calls, r.lines_with_usage)?;
     writeln!(
         out,
@@ -504,20 +591,26 @@ OPTIONS:
                      its transcript_path (plus that session's subagents)
   --json             Machine-readable output
   --line             One-line output (good for a status line)
+  --attention TYPE   gqa (default), mla or sparse — see MODEL below
   --kv J             KV-storage adder, joules per cache-read token (default 0; try 0–0.018)
   --simple-context   Use C = cache reads only (no W/2, O/2 correction)
   --no-subagents     Exclude subagent transcripts
   -h, --help         This help
 
-MODEL (inputs in tokens, energy in joules, reported as Wh = J/3600), per API call:
-  E = W*w_in*(1 + C/K_in) + O*w_out*(1 + C/K_out) + R*kv
-             w_in (J)  K_in     w_out (J)  K_out
-  low        0.108     60k      0.72       133k
-  central    0.288     26.7k    1.44       57.1k
-  high       0.612     28.3k    3.96       78.6k
+MODEL (inputs in tokens; energy in joules, reported as Wh = J/3600), per API call:
+  E = W*(N*e_in + prefill(C)) + O*(N*e_out + decode(C)) + R*kv
   W = uncached input + cache writes, O = output, R = cache reads,
   C = context in tokens (R + W/2 for W, R + W + O/2 for O; R with --simple-context).
-  K = crossover context at which attention cost equals the zero-context cost.";
+  Fixed efficiency: e_in = 7.8e-12 J and e_out = 3.9e-11 J per active parameter;
+  attention maths 2 pJ/FLOP; KV-cache reads 230 pJ/byte (facility level).
+  low / central / high = model architectures (128 query heads of size 128):
+    low      37B active, 61 layers   (DeepSeek-V3 scale)
+    central  122B active, 96 layers  (hypothetical midpoint)
+    high     405B active, 126 layers (Llama-3.1-405B scale)
+  Attention types:
+    gqa      8 KV heads, bf16 KV cache (~4 KB per token per layer)
+    mla      latent KV of 576 values (~1.2 KB per token per layer)
+    sparse   mla over the top 2,048 tokens plus a light fp8 indexer";
 
 fn main() {
     if let Err(e) = run() {
@@ -534,6 +627,7 @@ fn run() -> io::Result<()> {
     let (mut reset, mut hook, mut json, mut line, mut simple, mut subagents) =
         (false, false, false, false, false, true);
     let mut kv = 0.0f64;
+    let mut attention = Attention::Gqa;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -545,6 +639,11 @@ fn run() -> io::Result<()> {
             "--line" => line = true,
             "--simple-context" => simple = true,
             "--no-subagents" => subagents = false,
+            "--attention" => {
+                attention = args.next().as_deref().and_then(Attention::parse).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "--attention must be gqa, mla or sparse")
+                })?
+            }
             "--kv" => {
                 kv = args
                     .next()
@@ -576,7 +675,7 @@ fn run() -> io::Result<()> {
     }
 
     let files = collect(&paths, subagents);
-    let opts = Opts { simple_ctx: simple, kv };
+    let opts = Opts { simple_ctx: simple, kv, attention };
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
@@ -597,7 +696,7 @@ fn run() -> io::Result<()> {
         } else if line {
             writeln!(out, "⚡ {} ({}–{}) · {} calls", fmt_wh(rep.total.wh[1]), fmt_wh(rep.total.wh[0]), fmt_wh(rep.total.wh[2]), rep.total.calls)?;
         } else {
-            print_text("Claude Code energy estimate (cumulative)", &rep, &mut out)?;
+            print_text("Claude Code energy estimate (cumulative)", &rep, attention, &mut out)?;
         }
         return Ok(());
     }
@@ -608,6 +707,19 @@ fn run() -> io::Result<()> {
         PathBuf::from(home).join(".claude").join("cc-energy-cursor.json")
     });
     let mut cur = if reset { Cursor { version: 1, ..Default::default() } } else { load_cursor(&cpath) };
+    match cur.attention {
+        Some(a) if a != attention && !cur.files.is_empty() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cursor {} holds totals for --attention {}; use --reset or a different --cursor",
+                    cpath.display(),
+                    a.name()
+                ),
+            ))
+        }
+        _ => cur.attention = Some(attention),
+    }
     let mut delta = Report::default();
 
     for f in &files {
@@ -650,9 +762,9 @@ fn run() -> io::Result<()> {
     } else if line {
         print_line(&delta, &cur.totals, &mut out)?;
     } else {
-        print_text("Since last run", &delta, &mut out)?;
+        print_text("Since last run", &delta, attention, &mut out)?;
         writeln!(out)?;
-        print_text("Running total", &cur.totals, &mut out)?;
+        print_text("Running total", &cur.totals, attention, &mut out)?;
     }
     Ok(())
 }
@@ -665,43 +777,74 @@ mod tests {
         Tok { input, cache_write: cw, cache_read: cr, output: out }
     }
 
-    fn close(a: f64, b: f64) -> bool {
-        (a - b).abs() <= 1e-12 * a.abs().max(b.abs()).max(1.0)
+    fn opts(attention: Attention, simple_ctx: bool) -> Opts {
+        Opts { simple_ctx, kv: 0.0, attention }
+    }
+
+    fn close(a: f64, b: f64, rel: f64) -> bool {
+        (a - b).abs() <= rel * a.abs().max(b.abs()).max(1e-30)
     }
 
     #[test]
-    fn output_token_at_zero_context_costs_base_rate() {
-        // One output token, nothing else: Co = O/2 = 0.5 tokens of context.
-        let e = energy(&t(0, 0, 0, 1), true, 0.0);
-        assert!(close(e[1] * J_PER_WH, 1.44));
-        assert!(close(e[0] * J_PER_WH, 0.72));
-        assert!(close(e[2] * J_PER_WH, 3.96));
+    fn output_token_at_zero_context_is_weights_only() {
+        // One output token, no context (simple context => C = R = 0).
+        let e = energy(&t(0, 0, 0, 1), &opts(Attention::Gqa, true));
+        assert!(close(e[0] * J_PER_WH, 1.44, 1e-12));
+        assert!(close(e[1] * J_PER_WH, 1.44 * 122.0 / 37.0, 1e-12));
+        assert!(close(e[2] * J_PER_WH, 1.44 * 405.0 / 37.0, 1e-12));
     }
 
     #[test]
-    fn crossover_doubles_cost() {
-        // An input token seeing exactly K_in context costs 2x base.
-        let k = CENTRAL.k_in.round() as u64;
-        let e = energy(&t(1, 0, k, 0), true, 0.0);
-        let expected = 0.288 * (1.0 + k as f64 / CENTRAL.k_in);
-        assert!(close(e[1] * J_PER_WH, expected));
-        assert!((e[1] * J_PER_WH / 0.288 - 2.0).abs() < 1e-4);
+    fn matches_python_prototype() {
+        // Reference values from an independent Python implementation of the model
+        // (W = 5000, O = 400, R = 200,000, so Cw = 202,500 and Co = 205,200; Wh for low/central/high).
+        let cases = [
+            (Attention::Gqa, [4.118948864, 7.44745519, 13.481001154]),
+            (Attention::Mla, [3.739386368, 6.850110934, 12.696986818]),
+            (Attention::Sparse, [0.914139093, 2.403820141, 6.861230151]),
+        ];
+        for (att, expected) in cases {
+            let e = energy(&t(0, 5000, 200_000, 400), &opts(att, false));
+            for i in 0..3 {
+                assert!(close(e[i], expected[i], 1e-8), "{att:?}[{i}]: {} vs {}", e[i], expected[i]);
+            }
+        }
     }
 
     #[test]
-    fn matches_original_reckoner_units() {
-        // Central in the old units: W(MTok)*(80+3C) + O(MTok)*(400+7C), C in kTok, Wh.
-        let (w, o, r) = (5000.0, 400.0, 200_000.0);
-        let old = (w / 1e6) * (80.0 + 3.0 * r / 1e3) + (o / 1e6) * (400.0 + 7.0 * r / 1e3);
-        let e = energy(&t(0, 5000, 200_000, 400), true, 0.0);
-        assert!(close(e[1], old));
+    fn per_pair_costs_for_gqa_low() {
+        // 4 * 128 * 128 * 61 FLOPs * 2 pJ; 2 * 8 * 128 * 2 bytes * 61 * 230 pJ.
+        assert!(close(Attention::Gqa.prefill_j(61.0, 1.0), 7.995392e-6, 1e-9));
+        assert!(close(Attention::Gqa.decode_j(61.0, 1.0), 5.7466880e-5, 1e-9));
+    }
+
+    #[test]
+    fn sparse_attention_flattens_beyond_topk() {
+        let a = Attention::Sparse;
+        // Beyond 2,048 tokens only the indexer grows: slope = indexer cost per pair.
+        let slope_prefill = a.prefill_j(61.0, 200_000.0) - a.prefill_j(61.0, 100_000.0);
+        let indexer = 2.0 * 64.0 * 128.0 * 0.5 * 61.0 * 100_000.0 * J_PER_ATTN_FLOP;
+        assert!(close(slope_prefill, indexer, 1e-9));
+        assert!(a.prefill_j(61.0, 200_000.0) < Attention::Mla.prefill_j(61.0, 200_000.0) / 5.0);
+    }
+
+    #[test]
+    fn estimates_are_monotonic_across_scenarios() {
+        for att in [Attention::Gqa, Attention::Mla, Attention::Sparse] {
+            for &(w, r, o) in &[(1000, 0, 100), (5000, 50_000, 400), (2000, 300_000, 900)] {
+                let e = energy(&t(0, w, r, o), &opts(att, false));
+                assert!(e[0] < e[1] && e[1] < e[2], "{att:?} {e:?}");
+            }
+        }
     }
 
     #[test]
     fn kv_adder_is_per_cache_read_token() {
-        let base = energy(&t(0, 0, 1_000_000, 0), true, 0.0);
-        let kv = energy(&t(0, 0, 1_000_000, 0), true, 0.018);
-        assert!(close(kv[1] - base[1], 5.0)); // 1M tokens * 0.018 J = 5 Wh
+        let mut o = opts(Attention::Gqa, true);
+        let base = energy(&t(0, 0, 1_000_000, 0), &o);
+        o.kv = 0.018;
+        let kv = energy(&t(0, 0, 1_000_000, 0), &o);
+        assert!(close(kv[1] - base[1], 5.0, 1e-12)); // 1M tokens * 0.018 J = 5 Wh
     }
 
     fn line(id: &str, cw: u64, cr: u64, out: u64) -> String {
@@ -713,11 +856,11 @@ mod tests {
     #[test]
     fn dedups_streamed_lines_and_takes_max() {
         let data = line("r1", 100, 1000, 10) + &line("r1", 100, 1000, 50) + &line("r2", 10, 2000, 5);
-        let opts = Opts { simple_ctx: false, kv: 0.0 };
+        let o = opts(Attention::Gqa, false);
         let mut rep = Report::default();
         let mut seen = HashMap::new();
         let mut last = None;
-        process(data.as_bytes(), false, &opts, &mut rep, Some(&mut seen), None, &mut last).unwrap();
+        process(data.as_bytes(), false, &o, &mut rep, Some(&mut seen), None, &mut last).unwrap();
         assert_eq!(rep.total.calls, 2);
         assert_eq!(rep.total.tokens.output, 55);
         assert_eq!(rep.total.tokens.cache_read, 3000);
@@ -728,11 +871,11 @@ mod tests {
     fn partial_final_line_is_not_consumed() {
         let full = line("r1", 100, 1000, 10);
         let data = full.clone() + "{\"type\":\"assistant\",\"requestId\":\"r2\"";
-        let opts = Opts { simple_ctx: false, kv: 0.0 };
+        let o = opts(Attention::Gqa, false);
         let mut rep = Report::default();
         let mut ring = Seen::with_cap(8);
         let mut last = None;
-        let consumed = process(data.as_bytes(), false, &opts, &mut rep, None, Some(&mut ring), &mut last).unwrap();
+        let consumed = process(data.as_bytes(), false, &o, &mut rep, None, Some(&mut ring), &mut last).unwrap();
         assert_eq!(consumed, full.len() as u64);
         assert_eq!(rep.total.calls, 1);
     }
@@ -740,11 +883,11 @@ mod tests {
     #[test]
     fn sidechain_records_count_as_subagents() {
         let data = "{\"type\":\"assistant\",\"requestId\":\"s1\",\"isSidechain\":true,\"message\":{\"usage\":{\"input_tokens\":1,\"cache_creation_input_tokens\":10,\"cache_read_input_tokens\":100,\"output_tokens\":5}}}\n";
-        let opts = Opts { simple_ctx: false, kv: 0.0 };
+        let o = opts(Attention::Gqa, false);
         let mut rep = Report::default();
         let mut seen = HashMap::new();
         let mut last = None;
-        process(data.as_bytes(), false, &opts, &mut rep, Some(&mut seen), None, &mut last).unwrap();
+        process(data.as_bytes(), false, &o, &mut rep, Some(&mut seen), None, &mut last).unwrap();
         assert_eq!(rep.subagents.calls, 1);
         assert_eq!(rep.main.calls, 0);
     }

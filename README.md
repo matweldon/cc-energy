@@ -1,25 +1,37 @@
 # cc-energy
 
-Fast energy estimates for Claude Code JSONL transcripts, using a per-call ready reckoner.
+Fast energy estimates for Claude Code JSONL transcripts, using a per-call model.
 All inputs are token counts; energy is computed in joules and reported in Wh (J ÷ 3600).
 
 ```
-E = W·w_in·(1 + C/K_in) + O·w_out·(1 + C/K_out) + R·kv
+E = W·(N·e_in + prefill(C)) + O·(N·e_out + decode(C)) + R·kv
 ```
 
-w_in and w_out are joules per token at zero context. K_in and K_out are crossover context
-lengths in tokens: the context at which a token's attention cost equals its base cost
-(at C = K the token costs 2× its base; at C = 10K, 11×).
+- W = uncached input + cache writes, O = output, R = cache reads, all for one call.
+- N = the model's active parameters.
+- C = context in tokens seen by those tokens: R + W/2 for the W term and R + W + O/2 for the
+  O term. This correctly charges cache misses, where context reappears as W.
+  `--simple-context` uses C = R.
+- prefill(C) is attention arithmetic (FLOPs per context token); decode(C) is KV-cache reads
+  (bytes per context token).
 
-- low: w_in 0.108 J, K_in 60k; w_out 0.72 J, K_out 133k
-- central: w_in 0.288 J, K_in 26.7k; w_out 1.44 J, K_out 57.1k
-- high: w_in 0.612 J, K_in 28.3k; w_out 3.96 J, K_out 78.6k
-- kv (J per cache-read token): 0 by default; `--kv 0.018` for the top of the plausible range
+**One fixed set of efficiency figures:** e_in = 7.8e-12 J and e_out = 3.9e-11 J per active
+parameter per token; 2 pJ per attention FLOP; 230 pJ per KV-cache byte.
 
-W = uncached input + cache writes, O = output, R = cache reads, all for one call.
-C = context in tokens seen by those tokens: R + W/2 for the W term and R + W + O/2 for
-the O term (this correctly charges cache misses, where context reappears as W).
-`--simple-context` uses C = R.
+**Low / central / high are model architectures:**
+
+- low: 37B active parameters, 61 layers (DeepSeek V3 scale)
+- central: 122B active, 96 layers (hypothetical midpoint)
+- high: 405B active, 126 layers (Llama 3.1 405B scale)
+
+**Attention type** (`--attention`):
+
+- `gqa` (default): grouped-query attention, 8 KV heads, 16-bit cache
+- `mla`: compressed latent KV (DeepSeek V3 style), about 3.6× cheaper decoding
+- `sparse`: latent attention over the top 2,048 tokens plus a light indexer
+  (DeepSeek V3.2 style); long-context costs flatten
+
+`--kv J` adds J joules per cache-read token for KV storage (default 0; try up to 0.018).
 
 See [docs/methodology.md](docs/methodology.md) for the evidence behind the model and
 coefficients.
@@ -61,6 +73,7 @@ cc-energy ~/.claude/projects/<proj>/<session>.jsonl   # one session + its subage
 cc-energy running --line               # only what's new since last run, plus running total
 cc-energy running --reset              # start the running total again
 cc-energy --json                       # machine-readable
+cc-energy --attention sparse           # alternative attention design
 ```
 
 Paths can be directories (searched recursively) or session files. A session file also pulls in
@@ -78,6 +91,8 @@ The cursor (default `~/.claude/cc-energy-cursor.json`, override with `--cursor`)
   that straddle runs are counted once, and topped up if a later line reports more tokens.
 
 Half-written final lines are left for the next run. Cursor writes are atomic (write + rename).
+A cursor records the attention type it was built with and refuses to mix totals; use
+`--reset` or a separate `--cursor` per attention type.
 
 Timings on a 637 MB synthetic transcript: full scan ~0.4 s; running mode with nothing new
 ~5 ms; with one new call ~11 ms.
@@ -107,5 +122,7 @@ Global running tally updated after each turn (Stop hook), using a dedicated curs
 ## Caveats
 
 These are marginal, bottom-up estimates at facility level (PUE included) with wide uncertainty.
-Multiply by ~1–2 for real-world serving inefficiency; a top-down attributional share of fleet
-energy is roughly 3× the central figure or more. Anthropic publishes no per-token energy data.
+Claude's architecture is not public; the central model size and the attention type are the
+largest assumptions. Multiply by ~1–2 for real-world serving inefficiency. A top-down
+attributional share of fleet energy is roughly 1.5–2× the central figure for heavy use.
+Anthropic publishes no per-token energy data. See docs/methodology.md.
