@@ -109,6 +109,44 @@ Claude's architecture is not public. The three scenarios are three model scales,
 which dominates at short context. At long context the attention terms dominate, and their
 scale comes from the layer count.
 
+#### Total versus active parameters
+
+Energy follows **active** parameters, the weights each token actually passes through, not
+total parameters. The low and central scenarios assume mixture-of-experts (MoE) models, in
+which each token is routed through a few of many experts. DeepSeek V3, for example, has 671B
+parameters in total but 37B active. Only the high scenario is dense, standing in for "much
+more compute per token than current estimates".
+
+What is known about Claude's size:
+
+- **Anthropic has disclosed nothing:** no total or active parameter counts, expert counts
+  or routing ratios.
+- **The widely repeated ~1T (Sonnet) and ~5T (Opus) figures** are total-parameter numbers.
+  They come from Elon Musk's April 2026 remarks comparing Grok's size to Claude, extended
+  in a July 2026 post on X. They are unverified and may describe older models
+  ([36Kr](https://eu.36kr.com/en/p/3760679047267075);
+  [NextBigFuture](https://www.nextbigfuture.com/2026/04/anthropic-and-xai-model-parameter-counts.html);
+  [ExplainX review](https://www.explainx.ai/blog/claude-sonnet-opus-fable-parameter-counts-debate-july-2026);
+  [AIThinkerLab review](https://aithinkerlab.com/claude-opus-5-trillion-parameters/)).
+- **An independent estimate from serving speed**
+  ([Unexcited Neurons](https://unexcitedneurons.substack.com/p/estimating-the-size-of-claude-opus))
+  starts from the fact that decode speed is limited by the active weights read per token.
+  It calibrates against open models of known size on the same platform (Google Vertex) and
+  puts **Opus 4.6 at about 100–150B active parameters and roughly 1–3T total**, ±50%. It
+  puts Sonnet at about two-thirds of Opus. The same analysis suggests Opus 4/4.1 were much
+  larger (about 5–6T total), which is consistent with their 3× higher prices and may be the
+  origin of the 5T figure.
+
+The central scenario (122B active) sits inside the throughput-based range. The low scenario
+(37B) is probably too small for Opus-class models but plausible for smaller tiers. These
+estimates are for Opus 4.5/4.6; nothing public pins down later versions.
+
+Total size still matters somewhat. A model with trillions of parameters needs more
+accelerators just to hold its weights, and routing tokens between experts adds
+communication, both of which can reduce efficiency per active parameter. The weights
+calibration partly covers this because it comes from an MoE model (DeepSeek, 671B total),
+but a 2–3T model could be somewhat less efficient per active parameter than assumed.
+
 ### Attention types
 
 These determine the attention terms. The default is GQA.
@@ -321,8 +359,9 @@ bound on typical use, not a hard per-token limit.
 ## 7. Main uncertainties
 
 1. **Claude's architecture.** Active parameters, layers and attention design are not
-   public. The central model size and the attention type matter most: sparse attention
-   would cut long-context estimates by about 3–4×.
+   public. The best independent estimate (100–150B active for Opus 4.6) supports the
+   central case, but carries ±50% uncertainty. The attention type matters as much: sparse
+   attention would cut long-context estimates by about 3–4×.
 2. **No disclosure from Anthropic.** There are no published per-token, per-prompt or fleet
    inference energy figures for Claude. Watershed calls this the field's largest data gap
    ([via Hausfather](https://skepticalscience.com/print.php?n=6600)).
@@ -352,6 +391,11 @@ Architectures
 - DeepSeek V3.2 model config: https://huggingface.co/deepseek-ai/DeepSeek-V3.2/raw/main/config.json
 - DeepSeek V3.2 paper (sparse attention): https://huggingface.co/deepseek-ai/DeepSeek-V3.2/resolve/main/assets/paper.pdf
 - Llama 3.1 405B specifications: https://apxml.com/models/llama-3-1-405b
+- Unexcited Neurons, Estimating the size of Claude Opus 4.5/4.6: https://unexcitedneurons.substack.com/p/estimating-the-size-of-claude-opus
+- ExplainX, Claude parameter counts debate (July 2026): https://www.explainx.ai/blog/claude-sonnet-opus-fable-parameter-counts-debate-july-2026
+- 36Kr, Musk on Claude parameter counts: https://eu.36kr.com/en/p/3760679047267075
+- NextBigFuture, Anthropic and xAI model parameter counts: https://www.nextbigfuture.com/2026/04/anthropic-and-xai-model-parameter-counts.html
+- AIThinkerLab, evidence review of the 5T claim: https://aithinkerlab.com/claude-opus-5-trillion-parameters/
 
 Agentic usage logs
 - Simon Couch, Electricity use of AI coding agents: https://simonpcouch.com/blog/2026-01-20-cc-impact/

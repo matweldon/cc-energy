@@ -18,10 +18,10 @@ E = W·(N·e_in + prefill(C)) + O·(N·e_out + decode(C)) + R·kv
 **One fixed set of efficiency figures:** e_in = 7.8e-12 J and e_out = 3.9e-11 J per active
 parameter per token; 2 pJ per attention FLOP; 230 pJ per KV-cache byte.
 
-**Low / central / high are model architectures:**
+**Low / central / high are model architectures** (low and central assume mixture-of-experts; energy follows active, not total, parameters):
 
 - low: 37B active parameters, 61 layers (DeepSeek V3 scale)
-- central: 122B active, 96 layers (hypothetical midpoint)
+- central: 122B active, 96 layers (hypothetical midpoint; within the 100–150B independent estimate for Opus 4.6)
 - high: 405B active, 126 layers (Llama 3.1 405B scale)
 
 **Attention type** (`--attention`):
